@@ -1,12 +1,10 @@
 // ==UserScript==
 // @name         TwitchVODEnhancer (2026)
 // @namespace    https://github.com/sooqua/
-// @version      1.0.0
-// @author       mmrry <sl2007 at yandex dot com>
+// @version      1.3.0
 // @description  Chat-activity heatmap on the Twitch VOD seekbar (GQL rewrite of sooqua/TwitchVODEnhancer)
 // @match        https://www.twitch.tv/*
 // @run-at       document-start
-// @license      MIT
 // @grant        none
 // ==/UserScript==
 (function () {
@@ -15,10 +13,14 @@
     // ------------------------------------------------------------------ config
     const CFG = {
         binSec: 60,          // ширина одного столбца тепловой карты, сек
-        stripHeight: 6,      // высота полосы над seekbar, px
+        stripHeight: 6,      // высота полосы под seekbar, px
+        hitPad: 3,           // доп. зона наведения сверху/снизу полосы, px
+        labelOffset: 22,     // на сколько px выше seekbar показывать прогресс загрузки
+        labelHideDelay: 15000, // скрыть прогресс через N мс после 100%
         concurrency: 4,      // параллельных «воркеров» по сегментам VOD
         reqDelay: 60,        // пауза между запросами внутри воркера, мс
         percentile: 0.98,    // нормализация по перцентилю, чтобы один спайк не «гасил» всё
+        autoLoad: false,     // true — строить карту сразу при открытии VOD, без кнопки
         debug: true,         // логи в консоль с префиксом [TVE]
     };
     const DEFAULT_HASH = 'b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a';
@@ -164,25 +166,93 @@
     function ensureUI(st) {
         const bar = document.querySelector('[data-a-target="player-seekbar"]');
         if (!bar) return false;
-        if (st.canvas && bar.contains(st.canvas)) return true;
+        if (st.wrap && bar.contains(st.wrap)) return true;
         if (getComputedStyle(bar).position === 'static') bar.style.position = 'relative';
 
+        const stripBox = CFG.stripHeight + CFG.hitPad * 2;
+        const below = `calc(100% + ${stripBox + 1}px)`;   // под полосой тепловой карты
+
+        // Обёртка = зона наведения (чуть выше полосы, чтобы попадать мышью было легко)
+        const isNew = !st.wrap;
+        const wrap = st.wrap || document.createElement('div');
+        Object.assign(wrap.style, {
+            position: 'absolute', left: '0', top: '100%', width: '100%',
+            height: stripBox + 'px', padding: `${CFG.hitPad}px 0`, boxSizing: 'border-box',
+            zIndex: '5', cursor: 'default',
+        });
         const cv = st.canvas || document.createElement('canvas');
         Object.assign(cv.style, {
-            position: 'absolute', left: '0', bottom: '100%', width: '100%',
-            height: CFG.stripHeight + 'px', imageRendering: 'pixelated',
-            pointerEvents: 'none', zIndex: '5',
+            display: 'block', width: '100%', height: CFG.stripHeight + 'px',
+            imageRendering: 'pixelated', pointerEvents: 'none',
         });
+        const boxStyle = {
+            position: 'absolute', top: below, font: '10px/1.3 monospace', color: '#fff',
+            background: 'rgba(0,0,0,.7)', padding: '1px 5px', borderRadius: '3px',
+            pointerEvents: 'none', zIndex: '6', whiteSpace: 'nowrap',
+        };
         const lb = st.label || document.createElement('div');
-        Object.assign(lb.style, {
-            position: 'absolute', right: '0', bottom: `calc(100% + ${CFG.stripHeight + 2}px)`,
-            font: '10px/1.2 monospace', color: '#fff', background: 'rgba(0,0,0,.55)',
-            padding: '1px 4px', borderRadius: '2px', pointerEvents: 'none', zIndex: '5',
+        Object.assign(lb.style, boxStyle, {
+            right: '0', top: 'auto', bottom: `calc(100% + ${CFG.labelOffset}px)`,
+            fontSize: '11px', transition: 'opacity .5s',
+            display: st.labelHidden ? 'none' : 'block', opacity: st.labelHidden ? '0' : '1',
         });
-        bar.append(cv, lb);
-        st.canvas = cv; st.label = lb;
-        log('canvas attached to seekbar');
+        const tip = st.tip || document.createElement('div');
+        Object.assign(tip.style, boxStyle, { left: '0', display: 'none' });
+
+        wrap.append(cv);
+        bar.append(wrap, lb, tip);
+        if (isNew) {
+            wrap.addEventListener('mousemove', e => showTip(st, e));
+            wrap.addEventListener('mouseleave', () => hideTip(st));
+        }
+        Object.assign(st, { wrap, canvas: cv, label: lb, tip });
+        log('heatmap attached below seekbar');
         return true;
+    }
+
+    // ---------------------------------------------------------- 4b. подсказка
+    function isLoaded(st, t) {
+        if (st.done) return true;
+        const k = Math.min(Math.floor(t / st.segLen), st.segProgress.length - 1);
+        const segStart = k * st.segLen;
+        return st.segProgress[k] >= 1 || (t - segStart) / st.segLen < st.segProgress[k];
+    }
+
+    function activity(st, cnt) {
+        if (cnt === 0) return { text: 'чат молчал', color: '#aaa' };
+        const r = st.median ? cnt / st.median : 1;
+        if (r < 0.5) return { text: 'тихо', color: '#8fd' };
+        if (r < 1.5) return { text: 'обычная активность', color: '#fff' };
+        if (r < 3)   return { text: 'чат активен', color: '#ffde9e' };
+        return { text: 'всплеск активности 🔥', color: '#ff8a8c' };
+    }
+
+    function showTip(st, e) {
+        if (!st.bins || !st.tip) return;
+        const r = st.wrap.getBoundingClientRect();
+        const x = clamp((e.clientX - r.left) / r.width, 0, 0.9999);
+        const i = Math.min(Math.floor(x * st.duration / CFG.binSec), st.bins.length - 1);
+        const from = i * CFG.binSec;
+        const cnt = st.bins[i];
+
+        let text, color = '#fff';
+        if (!isLoaded(st, from)) {
+            text = 'ещё загружается…'; color = '#aaa';
+        } else {
+            const a = activity(st, cnt);
+            text = `${a.text} · ${cnt} сообщ.`;
+            color = a.color;
+        }
+        const tip = st.tip;
+        tip.textContent = text;
+        tip.style.color = color;
+        tip.style.display = 'block';
+        const w = tip.offsetWidth;
+        tip.style.left = clamp(x * r.width - w / 2, 0, r.width - w) + 'px';
+    }
+
+    function hideTip(st) {
+        if (st.tip) st.tip.style.display = 'none';
     }
 
     function draw(st) {
@@ -190,6 +260,7 @@
         const bins = st.bins, n = bins.length;
         const nz = Array.from(bins).filter(x => x > 0).sort((a, b) => a - b);
         const norm = nz.length ? nz[Math.min(nz.length - 1, Math.floor(nz.length * CFG.percentile))] : 1;
+        st.median = nz.length ? nz[Math.floor(nz.length / 2)] : 0;
 
         const cv = st.canvas;
         if (cv.width !== n) { cv.width = n; cv.height = 1; }
@@ -202,10 +273,17 @@
         }
         ctx.putImageData(img, 0, 0);
 
-        const prog = st.segProgress.reduce((a, b) => a + b, 0) / st.segProgress.length;
-        st.label.textContent = st.done
-            ? `chat: ${st.total.toLocaleString()} msgs`
-            : `chat: ${Math.round(prog * 100)}% · ${st.total.toLocaleString()}`;
+        if (st.error || st.labelHidden) return;
+        const prog = st.done ? 1 : st.segProgress.reduce((a, b) => a + b, 0) / st.segProgress.length;
+        st.label.textContent = `chat: ${Math.round(prog * 100)}% · ${st.total.toLocaleString()} msgs`;
+        if (st.done && !st.hideTimer) {
+            st.hideTimer = setTimeout(() => {
+                st.labelHidden = true;
+                if (!st.label) return;
+                st.label.style.opacity = '0';
+                setTimeout(() => { if (st.labelHidden && st.label) st.label.style.display = 'none'; }, 500);
+            }, CFG.labelHideDelay);
+        }
     }
 
     function scheduleDraw(st) {
@@ -215,27 +293,97 @@
     }
 
     function setError(st, msg) {
-        if (ensureUI(st)) { st.label.textContent = 'TVE: ' + msg; st.label.style.color = '#ff8080'; }
+        st.error = true;           // ошибку не скрываем и не перетираем прогрессом
+        st.labelHidden = false;
+        clearTimeout(st.hideTimer);
+        if (ensureUI(st)) {
+            Object.assign(st.label.style, { display: 'block', opacity: '1', color: '#ff8080' });
+            st.label.textContent = 'TVE: ' + msg;
+        }
     }
 
-    // ------------------------------------------------------- 5. контроллер SPA
+    // ------------------------------------------------- 5. кнопка «Get heatmap»
+    const BTN_TEXT = { idle: 'Get heatmap', loading: 'Loading…', error: 'Retry heatmap' };
+    let btn = null;
+    let btnMode = 'idle';        // idle | loading | error | hidden
+
+    // Ищем кнопку Clip и поднимаемся до прямого потомка группы правых контролов,
+    // чтобы вставить нашу кнопку на том же уровне, что и Clip.
+    function findClipAnchor() {
+        let clip = document.querySelector('[data-a-target="player-clip-button"]');
+        if (!clip) {
+            const ctr = document.querySelector('.player-controls__right-control-group')
+                || document.querySelector('[data-a-target="player-controls"]');
+            clip = ctr && [...ctr.querySelectorAll('button')].find(b => b !== btn &&
+                /\bclip\b|клип/i.test((b.getAttribute('aria-label') || '') + ' ' + b.textContent));
+        }
+        if (!clip) return null;
+        const group = clip.closest('.player-controls__right-control-group');
+        let node = clip;
+        if (group) while (node.parentElement && node.parentElement !== group) node = node.parentElement;
+        return node;
+    }
+
+    function createButton() {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.dataset.tve = 'heatmap-btn';
+        Object.assign(b.style, {
+            alignSelf: 'center', height: '30px', padding: '0 10px', marginRight: '6px',
+            border: 'none', borderRadius: '4px', background: 'rgba(255,255,255,.15)',
+            color: '#fff', font: '600 13px/30px Inter, Roobert, "Helvetica Neue", Arial, sans-serif',
+            whiteSpace: 'nowrap', transition: 'background .15s',
+        });
+        b.addEventListener('mouseenter', () => { if (!b.disabled) b.style.background = 'rgba(255,255,255,.28)'; });
+        b.addEventListener('mouseleave', () => { b.style.background = 'rgba(255,255,255,.15)'; });
+        b.addEventListener('click', e => {
+            e.preventDefault();
+            e.stopPropagation();          // не даём клику дойти до плеера (пауза/плей)
+            const vid = currentVid();
+            if (!vid || btnMode === 'loading') return;
+            if (state) stop();            // повтор после ошибки — начинаем с чистого листа
+            start(vid);
+        });
+        return b;
+    }
+
+    function setBtn(mode) { btnMode = mode; syncButton(); }
+
+    function syncButton() {
+        if (btnMode === 'hidden' || !currentVid()) { if (btn) btn.remove(); return; }
+        const anchor = findClipAnchor();
+        if (!anchor) return;                       // контролы ещё не отрисованы или скрыты
+        if (!btn) btn = createButton();
+        if (btn.nextSibling !== anchor) anchor.before(btn);
+        btn.textContent = BTN_TEXT[btnMode];
+        btn.disabled = btnMode === 'loading';
+        btn.style.opacity = btn.disabled ? '.6' : '1';
+        btn.style.cursor = btn.disabled ? 'default' : 'pointer';
+    }
+
+    // ------------------------------------------------------- 6. контроллер SPA
     const cache = new Map();   // vid -> завершённый state
     let state = null;
+    let lastVid = null;
 
     const currentVid = () => (location.pathname.match(/^\/videos\/(\d+)/) || [])[1] || null;
 
     async function start(vid) {
         if (cache.has(vid)) {
             state = cache.get(vid);
-            state.canvas = state.label = null;
+            state.wrap = state.canvas = state.label = state.tip = null;
+            state.labelHidden = true;   // из кеша — карта уже готова, прогресс не нужен
+            setBtn('hidden');
             log('from cache', vid);
             return;
         }
         const st = state = {
             vid, aborted: false, done: false, bins: null, total: 0,
-            segProgress: [], canvas: null, label: null, duration: 0,
+            segProgress: [], segLen: 1, median: 0, duration: 0,
+            wrap: null, canvas: null, label: null, tip: null,
         };
         window.__tve = st;   // для отладки из консоли
+        setBtn('loading');
         try {
             log('video', vid);
             const ok = await waitHeaders();
@@ -246,6 +394,7 @@
 
             st.bins = new Uint32Array(Math.max(1, Math.ceil(st.duration / CFG.binSec)));
             const K = CFG.concurrency, seg = st.duration / K;
+            st.segLen = seg;
             st.segProgress = new Array(K).fill(0);
             const t0 = performance.now();
             await Promise.all([...Array(K)].map((_, k) =>
@@ -254,26 +403,33 @@
             st.done = true;
             draw(st);
             cache.set(vid, st);
+            if (state === st) setBtn('hidden');
             log(`done: ${st.total} msgs in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
         } catch (e) {
+            if (st.aborted) return;
             console.error('[TVE]', e);
             setError(st, e.message.slice(0, 80));
+            if (state === st) setBtn('error');
         }
     }
 
     function stop() {
         if (!state) return;
         state.aborted = !state.done;
-        state.canvas && state.canvas.remove();
-        state.label && state.label.remove();
+        [state.wrap, state.label, state.tip].forEach(el => el && el.remove());
         state = null;
     }
 
     setInterval(() => {
         const vid = currentVid();
-        if (state && state.vid !== vid) stop();
-        if (!vid) return;
-        if (!state) start(vid);
-        else if (state.bins) draw(state);   // переподключение canvas после ререндера плеера
+        if (vid !== lastVid) {                     // смена страницы в SPA
+            if (state) stop();
+            lastVid = vid;
+            btnMode = 'idle';
+        }
+        if (!vid) { syncButton(); return; }
+        if (!state && (cache.has(vid) || (CFG.autoLoad && btnMode === 'idle'))) start(vid);
+        if (state && state.bins) draw(state);      // переподключение canvas после ререндера плеера
+        syncButton();                              // переподключение кнопки после ререндера контролов
     }, 1000);
 })();
