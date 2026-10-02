@@ -6,6 +6,12 @@ Userscript, который добавляет **тепловую карту ак
 
 Это переписанная в 2026 году версия [sooqua/TwitchVODEnhancer](https://github.com/sooqua/TwitchVODEnhancer) (2017). Оригинал перестал работать после редизайна плеера Twitch и отключения Kraken API и сервиса `rechat`.
 
+## Скриншоты
+
+![Screenshot1](screenshot1.png)
+
+![Screenshot2](screenshot2.png)
+
 ## Возможности
 
 - Загрузка по запросу: в панели плеера слева от **Clip** появляется кнопка **Get heatmap**. Пока её не нажать, никаких запросов не делается (`autoLoad: true` включает автоматическое построение). При ошибке кнопка превращается в **Retry heatmap**.
