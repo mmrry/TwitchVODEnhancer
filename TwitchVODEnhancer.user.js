@@ -1,292 +1,279 @@
 // ==UserScript==
-// @name         TwitchVODEnhancer
-// @author       sooqua
+// @name         TwitchVODEnhancer (2026)
 // @namespace    https://github.com/sooqua/
-// @downloadURL  https://github.com/sooqua/TwitchVODEnhancer/raw/master/TwitchVODEnhancer.user.js
-// @version      0.4
-// @match        *://*.twitch.tv/*
+// @version      1.0.0
+// @author       mmrry <sl2007 at yandex dot com>
+// @description  Chat-activity heatmap on the Twitch VOD seekbar (GQL rewrite of sooqua/TwitchVODEnhancer)
+// @match        https://www.twitch.tv/*
 // @run-at       document-start
-// @grant        GM_addStyle
+// @license MIT
+// @grant        none
 // ==/UserScript==
-(function() {
+(function () {
     'use strict';
 
-    const client_id = 'ENTER_YOUR_CLIENT_ID',
-        canvas_width = 2500,
-        canvas_height = 1,
-        slider_height = 2.6,
-        slider_height_unit = 'em',
-        step = 60000, // msec.
-        auto_zoom = 1; // width of one step (%), non-zero values override the 'zoom' value
-    let zoom = 3;
-    const gradient = [
-        [
-            0,
-            [0, 0, 0]
-        ],
-        [
-            25,
-            [60, 100, 90]
-        ],
-        [
-            30,
-            [132, 220, 198]
-        ],
-        [
-            33,
-            [165, 255, 214]
-        ],
-        [
-            35,
-            [255, 222, 158]
-        ],
-        [
-            85,
-            [255, 166, 158]
-        ],
-        [
-            100,
-            [255, 104, 107]
-        ]
+    // ------------------------------------------------------------------ config
+    const CFG = {
+        binSec: 60,          // ширина одного столбца тепловой карты, сек
+        stripHeight: 6,      // высота полосы над seekbar, px
+        concurrency: 4,      // параллельных «воркеров» по сегментам VOD
+        reqDelay: 60,        // пауза между запросами внутри воркера, мс
+        percentile: 0.98,    // нормализация по перцентилю, чтобы один спайк не «гасил» всё
+        debug: true,         // логи в консоль с префиксом [TVE]
+    };
+    const DEFAULT_HASH = 'b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a';
+    const FALLBACK_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+    const GRADIENT = [
+        [0, [0, 0, 0]], [25, [60, 100, 90]], [30, [132, 220, 198]], [33, [165, 255, 214]],
+        [35, [255, 222, 158]], [85, [255, 166, 158]], [100, [255, 104, 107]],
     ];
-    const slider_half_height = slider_height / 2;
 
-    let steps_data_mc = [],
-        steps_data_ts = [];
+    const log = (...a) => CFG.debug && console.log('%c[TVE]', 'color:#a970ff;font-weight:bold', ...a);
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
 
-    let observer;
+    // ------------------------------------- 1. перехват заголовков GQL страницы
+    // Client-Integrity сгенерировать самому нельзя — берём у самого Twitch.
+    const KEEP = ['client-id', 'client-integrity', 'authorization', 'x-device-id',
+        'client-session-id', 'client-version', 'accept-language'];
+    const captured = { headers: null, hash: null };
+    const waiters = [];
+    const origFetch = window.fetch;
 
-    async function init() {
-        await initOn(document);
-        observer = new MutationObserver(function(mutations) {
-            mutations.forEach(function(mutation) {
-                mutation.addedNodes.forEach(async function(node) {
-                    if (node instanceof HTMLElement) {
-                        await initOn(node);
+    window.fetch = function (input, init) {
+        try {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            if (url.startsWith('https://gql.twitch.tv/gql')) {
+                const h = new Headers((init && init.headers) || (input instanceof Request ? input.headers : undefined));
+                if (h.get('client-integrity')) {
+                    const o = {};
+                    KEEP.forEach(k => { const v = h.get(k); if (v) o[k] = v; });
+                    if (!captured.headers) log('headers captured:', Object.keys(o).join(', '));
+                    captured.headers = o;
+                    waiters.splice(0).forEach(fn => fn());
+                }
+                const body = init && init.body;
+                if (typeof body === 'string' && body.includes('VideoCommentsByOffsetOrCursor')) {
+                    for (const op of [].concat(JSON.parse(body))) {
+                        const hash = op.extensions && op.extensions.persistedQuery && op.extensions.persistedQuery.sha256Hash;
+                        if (op.operationName === 'VideoCommentsByOffsetOrCursor' && hash && hash !== captured.hash) {
+                            captured.hash = hash;
+                            log('comments hash:', hash);
+                        }
                     }
-                });
-            });
-        });
-        observer.observe(document.body, {childList: true, subtree: true});
-    }
-
-    async function initOn(base) {
-        let slider = base.querySelector('.js-player-slider');
-        if (!slider) return;
-        let slider_handle = base.querySelector('.ui-slider-handle');
-        if (!slider_handle) return;
-        observer.disconnect();
-
-        let vid_id = /twitch.tv\/videos\/(\d+)/.exec(window.location.href)[1];
-
-        let r = await getJson('https://api.twitch.tv/kraken/videos/' + vid_id + '?client_id=' + client_id),
-            vid_start = new Date(r.recorded_at).getTime(),
-            vid_length = r.length * 1000,
-            vid_end = vid_start + vid_length,
-            step_width = Math.round(step / vid_length * canvas_width);
-
-        if (auto_zoom) {
-            zoom = (auto_zoom / (step_width / canvas_width * 100)).clamp(1, 100);
-        }
-
-        GM_addStyle(`
-        .player-seek {
-            top: 0px !important;
-        }
-        .canvasWrapper {
-            transform: translateZ(0) !important;
-            overflow: hidden !important;
-        }
-        .js-player-slider:before {
-            display: none !important;
-        }
-        .js-player-slider > .ui-slider-range {
-            pointer-events: none !important;
-            z-index: 1 !important;
-            background: rgba(169, 145, 212, .5) !important;
-            height: ${slider_height + slider_height_unit} !important;
-            top: 0px !important;
-            transition: initial !important;
-        }
-        .js-player-slider > .ui-slider-handle {
-            pointer-events: none !important;
-            width: .1em !important;
-            height: ${slider_height + slider_height_unit} !important;
-            background: black !important;
-            border: .1em dotted white !important;
-            margin-left: 0em !important;
-            top: 0em !important;
-            border-radius: initial !important;
-            transition: initial !important;
-        }
-        .player-slider--roundhandle .ui-slider-handle:before {
-            display: none !important;
-        }
-        .player-slider__popup-container {
-            box-shadow: none !important;
-            background: hsla(0,0%,0%,.5) !important;
-        }
-        .player-slider__muted-segments {
-            pointer-events: none !important;
-            height: ${slider_half_height + slider_height_unit} !important;
-            top: ${slider_half_height + slider_height_unit} !important;
-        }
-        .player-slider__muted {
-            pointer-events: none !important;
-            height: ${slider_half_height + slider_height_unit} !important;
-        }
-        .sliderCanvas:hover {
-            transform: scale(${zoom}, 1) !important;
-        }`);
-
-        let wrapper = document.createElement('div');
-        wrapper.className = 'canvasWrapper';
-
-        let c = document.createElement('canvas');
-        c.className = 'sliderCanvas';
-        c.width = canvas_width;
-        c.height = canvas_height;
-        c.style.width = '100%';
-        c.style.height = slider_height + slider_height_unit;
-
-        wrapper.appendChild(c);
-        slider.appendChild(wrapper);
-
-        let sheet;
-        c.addEventListener('mousemove', function(e) {
-            let r = wrapper.getBoundingClientRect(),
-                m = (e.pageX - r.left) / r.width * 100;
-            c.style.transformOrigin = m + '% center 0px';
-            let m_h = (parseFloat(slider_handle.style.left) * zoom - m * zoom + m).clamp(0, 100);
-
-            let s = `
-            .ui-slider-handle {
-                left: ${m_h}% !important;
-            }
-            .ui-slider-range {
-                width: ${m_h}% !important;
-            }`;
-
-            let muted_bars = document.querySelectorAll('.player-slider__muted');
-            for (let i = 0, l = muted_bars.length; i < l; ++i) {
-                let m_b = (parseFloat(muted_bars[i].style.left) * zoom - m * zoom + m).clamp(0, 100);
-                s += `
-                .js-muted-segments-container > span:nth-child(${i + 1}) {
-                    left: ${m_b}% !important;
-                    transform: scale(${zoom}, 1) !important;
-                    transform-origin: left !important;
-                }`;
-            }
-
-            sheet = setStyle(s, sheet);
-        });
-        c.addEventListener('mouseout', function() {
-            sheet = setStyle('', sheet);
-        });
-
-        let last_step_ts = vid_start,
-            curr_step_mc = 0,
-            ctx = c.getContext('2d');
-        ctx.fillStyle = 'rgba(0, 0, 0, .5)';
-        ctx.fillRect(0, 0, canvas_width, canvas_height);
-        for (let ts = vid_start; ts < vid_end; ts += 30000) {
-            r = await getJson('https://rechat.twitch.tv/rechat-messages?video_id=v' + vid_id + '&start=' + Math.round(ts / 1000));
-            if (r.data.length === 0) {
-                continue;
-            }
-
-            for (let i = 0; i < r.data.length; i++) {
-                curr_step_mc++;
-                let curr_msg_ts = r.data[i].attributes.timestamp;
-                if (curr_msg_ts - last_step_ts >= step) {
-                    steps_data_ts.push(curr_msg_ts);
-                    steps_data_mc.push(curr_step_mc);
-                    curr_step_mc = 0;
-
-                    let steps_data_mc_max = Math.max(...steps_data_mc);
-                    if (steps_data_mc_max <= 0) continue;
-
-                    for (let i = 0, l = steps_data_mc.length; i < l; ++i) {
-                        let pos = ((steps_data_ts[i] - vid_start) / (vid_end - vid_start)).clamp(0, 1),
-                            int = (steps_data_mc[i] / steps_data_mc_max * 100).clamp(1, 100),
-                            col = pickGradientColor(int, gradient);
-                        ctx.fillStyle = 'rgb(' + col.join() + ')';
-                        ctx.fillRect(Math.round(pos * canvas_width) - step_width, 0, step_width, canvas_height);
-                    }
-
-                    last_step_ts = curr_msg_ts;
                 }
             }
-        }
-    }
-    
-    function getJson(url) {
-        return new Promise(function(resolve) {
-            let xhr = new XMLHttpRequest();
-            xhr.addEventListener('load', function() { resolve(JSON.parse(this.responseText)); });
-            xhr.open('GET', url,);
-            xhr.send();
+        } catch (e) { log('hook error', e); }
+        return origFetch.apply(this, arguments);
+    };
+
+    function waitHeaders(timeout = 15000) {
+        if (captured.headers) return Promise.resolve(true);
+        return new Promise(res => {
+            const t = setTimeout(() => res(false), timeout);
+            waiters.push(() => { clearTimeout(t); res(true); });
         });
     }
 
-    function pickGradientColor(position, gradient) {
-        let color_range = [];
-        for (let i = 0; i < gradient.length; i++) {
-            if (position<=gradient[i][0]) {
-                color_range = [i-1,i];
-                break;
+    // ------------------------------------------------------------- 2. GQL
+    async function gql(body) {
+        const headers = {
+            'Content-Type': 'text/plain;charset=UTF-8',
+            ...(captured.headers || { 'client-id': FALLBACK_CLIENT_ID }),
+        };
+        const r = await origFetch.call(window, 'https://gql.twitch.tv/gql', {
+            method: 'POST', headers, body: JSON.stringify(body),
+        });
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j) throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
+        if (j.errors && j.errors.length) throw new Error('GQL: ' + j.errors.map(e => e.message).join('; '));
+        return j.data;
+    }
+
+    const commentsQuery = (videoID, vars) => ({
+        operationName: 'VideoCommentsByOffsetOrCursor',
+        variables: { videoID, ...vars },
+        extensions: { persistedQuery: { version: 1, sha256Hash: captured.hash || DEFAULT_HASH } },
+    });
+
+    async function fetchPage(vid, vars) {
+        for (let a = 0; ; a++) {
+            try { return await gql(commentsQuery(vid, vars)); }
+            catch (e) {
+                if (a >= 4) throw e;
+                log(`retry ${a + 1} (${JSON.stringify(vars)}):`, e.message);
+                if (/integrity/i.test(e.message)) {   // токен протух — ждём свежий от страницы
+                    captured.headers = null;
+                    await waitHeaders(30000);
+                }
+                await sleep(1000 * 2 ** a);
             }
         }
-
-        //Get the two closest colors
-        let first_color = gradient[color_range[0]][1],
-            second_color = gradient[color_range[1]][1];
-
-        //Calculate ratio between the two closest colors
-        let first_color_x = gradient[color_range[0]][0]/100,
-            second_color_x = gradient[color_range[1]][0]/100-first_color_x,
-            slider_x = position/100-first_color_x,
-            ratio = slider_x/second_color_x;
-
-        return pickHex( second_color,first_color, ratio );
     }
 
-    function pickHex(color1, color2, weight) {
-        let w = weight * 2 - 1,
-            w1 = (w+1) / 2,
-            w2 = 1 - w1;
-        return [Math.round(color1[0] * w1 + color2[0] * w2),
-            Math.round(color1[1] * w1 + color2[1] * w2),
-            Math.round(color1[2] * w1 + color2[2] * w2)];
+    async function getDuration(vid) {
+        try {
+            const d = await gql({ query: `query{video(id:"${vid}"){lengthSeconds}}` });
+            if (d && d.video && d.video.lengthSeconds) return d.video.lengthSeconds;
+        } catch (e) { log('lengthSeconds via GQL failed, fallback to <video>:', e.message); }
+        for (let i = 0; i < 60; i++) {
+            const v = document.querySelector('video');
+            if (v && isFinite(v.duration) && v.duration > 0) return v.duration;
+            await sleep(500);
+        }
+        throw new Error('cannot determine VOD duration');
     }
 
-    function setStyle(cssText) {
-        let sheet = document.createElement('style');
-        sheet.type = 'text/css';
-        /* Optional */ window.customSheet = sheet;
-        (document.head || document.getElementsByTagName('head')[0]).appendChild(sheet);
-        return (setStyle = function(cssText, node) {
-            if(!node || node.parentNode !== sheet)
-                return sheet.appendChild(document.createTextNode(cssText));
-            node.nodeValue = cssText;
-            return node;
-        })(cssText);
+    // ---------------------------------------------------- 3. сбор комментариев
+    async function crawlSegment(st, k, start, end) {
+        let vars = { contentOffsetSeconds: Math.floor(start) };
+        const n = st.bins.length;
+        while (!st.aborted) {
+            const data = await fetchPage(st.vid, vars);
+            const c = data && data.video && data.video.comments;
+            if (!c) throw new Error('unexpected response: ' + JSON.stringify(data).slice(0, 300));
+            let cursor = null;
+            for (const e of c.edges || []) {
+                cursor = e.cursor || cursor;
+                const t = e.node && e.node.contentOffsetSeconds;
+                if (t == null || t < start) continue;   // перекрытие с предыдущим сегментом
+                if (t >= end) { st.segProgress[k] = 1; return; }
+                st.bins[Math.min(Math.floor(t / CFG.binSec), n - 1)]++;
+                st.total++;
+                st.segProgress[k] = isFinite(end) ? (t - start) / (end - start) : t / st.duration;
+            }
+            scheduleDraw(st);
+            if (!c.pageInfo || !c.pageInfo.hasNextPage || !cursor) { st.segProgress[k] = 1; return; }
+            vars = { cursor };
+            await sleep(CFG.reqDelay);
+        }
     }
 
-    /**
-    * Returns a number whose value is limited to the given range.
-    *
-    * Example: limit the output of this computation to between 0 and 255
-    * (x * 255).clamp(0, 255)
-    *
-    * @param {Number} min The lower boundary of the output range
-    * @param {Number} max The upper boundary of the output range
-    * @returns A number in the range [min, max]
-    * @type Number
-    */
-    Number.prototype.clamp = function(min, max) {
-        return Math.min(Math.max(this, min), max);
-    };
+    // ------------------------------------------------------------ 4. отрисовка
+    function pickColor(p) {
+        for (let i = 1; i < GRADIENT.length; i++) {
+            const [x1, c1] = GRADIENT[i - 1], [x2, c2] = GRADIENT[i];
+            if (p <= x2) {
+                const t = (p - x1) / (x2 - x1);
+                return c1.map((v, j) => Math.round(v + (c2[j] - v) * t));
+            }
+        }
+        return GRADIENT[GRADIENT.length - 1][1];
+    }
 
-    document.addEventListener('DOMContentLoaded', init);
+    function ensureUI(st) {
+        const bar = document.querySelector('[data-a-target="player-seekbar"]');
+        if (!bar) return false;
+        if (st.canvas && bar.contains(st.canvas)) return true;
+        if (getComputedStyle(bar).position === 'static') bar.style.position = 'relative';
+
+        const cv = st.canvas || document.createElement('canvas');
+        Object.assign(cv.style, {
+            position: 'absolute', left: '0', bottom: '100%', width: '100%',
+            height: CFG.stripHeight + 'px', imageRendering: 'pixelated',
+            pointerEvents: 'none', zIndex: '5',
+        });
+        const lb = st.label || document.createElement('div');
+        Object.assign(lb.style, {
+            position: 'absolute', right: '0', bottom: `calc(100% + ${CFG.stripHeight + 2}px)`,
+            font: '10px/1.2 monospace', color: '#fff', background: 'rgba(0,0,0,.55)',
+            padding: '1px 4px', borderRadius: '2px', pointerEvents: 'none', zIndex: '5',
+        });
+        bar.append(cv, lb);
+        st.canvas = cv; st.label = lb;
+        log('canvas attached to seekbar');
+        return true;
+    }
+
+    function draw(st) {
+        if (!st.bins || !ensureUI(st)) return;
+        const bins = st.bins, n = bins.length;
+        const nz = Array.from(bins).filter(x => x > 0).sort((a, b) => a - b);
+        const norm = nz.length ? nz[Math.min(nz.length - 1, Math.floor(nz.length * CFG.percentile))] : 1;
+
+        const cv = st.canvas;
+        if (cv.width !== n) { cv.width = n; cv.height = 1; }
+        const ctx = cv.getContext('2d');
+        const img = ctx.createImageData(n, 1);
+        for (let i = 0; i < n; i++) {
+            const has = bins[i] > 0;
+            const [r, g, b] = has ? pickColor(clamp(bins[i] / norm * 100, 1, 100)) : [0, 0, 0];
+            img.data.set([r, g, b, has ? 255 : 90], i * 4);
+        }
+        ctx.putImageData(img, 0, 0);
+
+        const prog = st.segProgress.reduce((a, b) => a + b, 0) / st.segProgress.length;
+        st.label.textContent = st.done
+            ? `chat: ${st.total.toLocaleString()} msgs`
+            : `chat: ${Math.round(prog * 100)}% · ${st.total.toLocaleString()}`;
+    }
+
+    function scheduleDraw(st) {
+        if (st.drawPending) return;
+        st.drawPending = true;
+        requestAnimationFrame(() => { st.drawPending = false; if (!st.aborted) draw(st); });
+    }
+
+    function setError(st, msg) {
+        if (ensureUI(st)) { st.label.textContent = 'TVE: ' + msg; st.label.style.color = '#ff8080'; }
+    }
+
+    // ------------------------------------------------------- 5. контроллер SPA
+    const cache = new Map();   // vid -> завершённый state
+    let state = null;
+
+    const currentVid = () => (location.pathname.match(/^\/videos\/(\d+)/) || [])[1] || null;
+
+    async function start(vid) {
+        if (cache.has(vid)) {
+            state = cache.get(vid);
+            state.canvas = state.label = null;
+            log('from cache', vid);
+            return;
+        }
+        const st = state = {
+            vid, aborted: false, done: false, bins: null, total: 0,
+            segProgress: [], canvas: null, label: null, duration: 0,
+        };
+        window.__tve = st;   // для отладки из консоли
+        try {
+            log('video', vid);
+            const ok = await waitHeaders();
+            if (!ok) log('integrity headers not captured in 15s, trying with client-id only');
+            st.duration = await getDuration(vid);
+            log('duration', st.duration, 's');
+            if (st.aborted) return;
+
+            st.bins = new Uint32Array(Math.max(1, Math.ceil(st.duration / CFG.binSec)));
+            const K = CFG.concurrency, seg = st.duration / K;
+            st.segProgress = new Array(K).fill(0);
+            const t0 = performance.now();
+            await Promise.all([...Array(K)].map((_, k) =>
+                crawlSegment(st, k, k * seg, k === K - 1 ? Infinity : (k + 1) * seg)));
+            if (st.aborted) return;
+            st.done = true;
+            draw(st);
+            cache.set(vid, st);
+            log(`done: ${st.total} msgs in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        } catch (e) {
+            console.error('[TVE]', e);
+            setError(st, e.message.slice(0, 80));
+        }
+    }
+
+    function stop() {
+        if (!state) return;
+        state.aborted = !state.done;
+        state.canvas && state.canvas.remove();
+        state.label && state.label.remove();
+        state = null;
+    }
+
+    setInterval(() => {
+        const vid = currentVid();
+        if (state && state.vid !== vid) stop();
+        if (!vid) return;
+        if (!state) start(vid);
+        else if (state.bins) draw(state);   // переподключение canvas после ререндера плеера
+    }, 1000);
 })();
