@@ -8,6 +8,7 @@ This is a 2026 rewrite of [sooqua/TwitchVODEnhancer](https://github.com/sooqua/T
 
 ## Features
 
+- On-demand loading: a **Get heatmap** button appears in the player controls, left of **Clip**. Nothing is requested until you click it (set `autoLoad: true` to build the map automatically). On error the button turns into **Retry heatmap**.
 - Heatmap strip right below the native seekbar, aligned with the VOD timeline (1 minute per column by default).
 - Hover tooltip with the activity level and the number of messages at that moment:
 
@@ -31,7 +32,7 @@ This is a 2026 rewrite of [sooqua/TwitchVODEnhancer](https://github.com/sooqua/T
 1. Install a userscript manager, e.g. [Tampermonkey](https://www.tampermonkey.net/).
    On Chrome 138+ also open `chrome://extensions` → Tampermonkey → **Details** and enable **Allow User Scripts**.
 2. Open [`TwitchVODEnhancer.user.js`](TwitchVODEnhancer.user.js), click **Raw** and confirm the installation.
-3. Open any VOD (`https://www.twitch.tv/videos/...`) — the heatmap appears under the seekbar.
+3. Open any VOD (`https://www.twitch.tv/videos/...`) and click **Get heatmap** next to **Clip** — the heatmap appears under the seekbar.
 
 If you have the old 2017 version installed, disable or remove it first.
 
@@ -63,6 +64,7 @@ Edit the `CFG` object at the top of the script:
 | `concurrency` | `4` | Number of parallel loaders |
 | `reqDelay` | `60` | Pause between requests within one loader, ms |
 | `percentile` | `0.98` | Color normalization percentile, so a single spike does not wash out the rest |
+| `autoLoad` | `false` | Build the heatmap automatically when a VOD opens, without the button |
 | `debug` | `true` | Log `[TVE]` messages to the console |
 
 ## Troubleshooting
