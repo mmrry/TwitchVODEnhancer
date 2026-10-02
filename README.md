@@ -7,7 +7,9 @@ A userscript that adds a **chat activity heatmap** under the Twitch VOD seekbar.
 This is a 2026 rewrite of [sooqua/TwitchVODEnhancer](https://github.com/sooqua/TwitchVODEnhancer) (2017), which stopped working after Twitch redesigned its player and shut down the Kraken API and the `rechat` service.
 
 ## Screenshots
+
 ![Screenshot1](screenshot1.png)
+
 ![Screenshot2](screenshot2.png)
 
 ## Features
