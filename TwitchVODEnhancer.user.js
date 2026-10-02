@@ -5,6 +5,7 @@
 // @description  Chat-activity heatmap on the Twitch VOD seekbar (GQL rewrite of sooqua/TwitchVODEnhancer)
 // @match        https://www.twitch.tv/*
 // @run-at       document-start
+// @license MIT
 // @grant        none
 // ==/UserScript==
 (function () {
